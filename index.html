@@ -1513,6 +1513,22 @@ const RANGES = {
 };
 const GAUGE_DISPLAY_MAX = { ph:14, tds:2000, turb:100, do:16, temp:40 };
 
+// Physically-plausible envelope per parameter, much wider than the "safe" range.
+// A reading outside this isn't a water-quality alert, it's almost certainly bad
+// data (wrong field, sensor glitch, etc.), so we treat it as no-data rather than
+// display it or let it trigger the pump.
+const PLAUSIBLE_BOUNDS = {
+  ph:   { min: 0,   max: 14   },
+  tds:  { min: 0,   max: 5000 },
+  turb: { min: 0,   max: 1000 },
+  do:   { min: 0,   max: 20   },
+  temp: { min: -5,  max: 50   },
+};
+
+// How old a ThingSpeak feed entry can be before pHixHub stops treating it as
+// current and shows a "no recent data" placeholder instead.
+const STALE_AFTER_MS = 60 * 60 * 1000; // 1 hour
+
 /* ---------------- KNOWN LOCATIONS: reference sites with documented water quality issues ---------------- */
 const KNOWN_LOCATIONS = [
   { name: "Willapa Bay, WA",       lat: 46.570, lng: -123.950, issue: "Ocean acidification (low pH)",            parameter: "pH",                paramKey: "ph",   direction: "low"  },
@@ -1830,6 +1846,32 @@ async function fetchLatest(){
       turb: parseFloat(feed.field5),
     };
     const lat = feed.field6, lng = feed.field7;
+
+    // Drop any reading outside what's physically plausible — a wrong field
+    // mapping or sensor glitch can produce huge/negative garbage numbers, and
+    // those should show as no-data rather than as a "crazy" value on the gauge.
+    Object.keys(readings).forEach(key=>{
+      const b = PLAUSIBLE_BOUNDS[key];
+      if(!isNaN(readings[key]) && (readings[key] < b.min || readings[key] > b.max)){
+        readings[key] = NaN;
+      }
+    });
+
+    // If the most recent feed entry is over an hour old, don't present it as
+    // current — show a clear "no recent data" state instead of stale numbers.
+    const feedAgeMs = Date.now() - new Date(feed.created_at).getTime();
+    const isStale = isNaN(feedAgeMs) ? false : feedAgeMs > STALE_AFTER_MS;
+    if(isStale){
+      Object.keys(readings).forEach(key=> setGauge(key, NaN));
+      document.getElementById('lastUpdated').textContent = new Date(feed.created_at).toLocaleString() + ' (stale)';
+      note.textContent = `No data in the last hour from channel ${channelId}. Showing placeholder values until a new reading comes in.`;
+      if(!window.__phixhubStaleWarned){
+        window.__phixhubStaleWarned = true;
+        pushNotification('Last reading is over an hour old. Gauges are showing placeholders instead of stale data.', 'warn');
+      }
+      return;
+    }
+    window.__phixhubStaleWarned = false;
 
     // Diagnostic: if every field came back unusable, the field mapping or channel
     // is almost certainly wrong. Surface that plainly instead of failing silently.
